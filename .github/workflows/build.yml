@@ -1,0 +1,32 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Werkzeuge anzeigen
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: App bauen und verpacken
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          chmod +x scripts/package_app.sh
+          ./scripts/package_app.sh
+
+      - name: App hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fontwerk-${{ github.run_number }}
+          path: build/Fontwerk.zip
+          if-no-files-found: error
