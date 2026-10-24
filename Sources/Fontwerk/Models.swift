@@ -7,12 +7,16 @@ enum ActivationState: String, Codable, CaseIterable {
     case session
     /// Registered permanently (survives logout and restart).
     case persistent
+    /// Available to apps, but not through Fontwerk, e.g. because the
+    /// file lies in a macOS font folder.
+    case external
 
     var label: String {
         switch self {
         case .inactive: return "Inaktiv"
         case .session: return "Aktiv bis Abmelden"
         case .persistent: return "Dauerhaft aktiv"
+        case .external: return "Aktiv über macOS-Schriftordner"
         }
     }
 
@@ -79,6 +83,37 @@ struct LibraryData: Codable {
     var version: Int
     var fonts: [FontRecord]
     var sets: [FontSet]
+}
+
+/// Fonts that stayed available to apps after a deactivation, with the
+/// files macOS still provides them from.
+struct StillActiveReport: Identifiable {
+    struct Entry {
+        var fontName: String
+        var locations: [URL]
+    }
+    let id = UUID()
+    var entries: [Entry]
+
+    var allLocations: [URL] {
+        var seen = Set<URL>()
+        return entries.flatMap(\.locations).filter { seen.insert($0).inserted }
+    }
+
+    var summary: String {
+        let examples = entries.prefix(5).map { entry -> String in
+            let places = entry.locations.prefix(2).map { url -> String in
+                let folder = ActivationService.displayPath(url)
+                return url.path.hasPrefix("/System/") ? "\(folder) (Systemschrift)" : folder
+            }
+            return "• \(entry.fontName): \(places.joined(separator: ", "))"
+        }
+        var text = "Diese Schriften stehen Apps weiterhin zur Verfügung, weil macOS sie aus einer anderen Datei oder einem Schriftordner lädt:\n\n"
+        text += examples.joined(separator: "\n")
+        if entries.count > 5 { text += "\n… und \(entries.count - 5) weitere" }
+        text += "\n\nUm sie zu deaktivieren, entferne diese Dateien aus dem Ordner (Systemschriften lassen sich nicht deaktivieren). Bereits laufende Programme zeigen eine Schrift teils bis zum Neustart weiter an."
+        return text
+    }
 }
 
 struct ImportProgress: Equatable {

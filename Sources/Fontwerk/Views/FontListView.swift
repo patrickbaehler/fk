@@ -165,6 +165,8 @@ struct StatusIcon: View {
                     Image(systemName: "circle.fill").foregroundStyle(.green)
                 case .persistent:
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                case .external:
+                    Image(systemName: "checkmark.circle").foregroundStyle(.blue)
                 }
             }
         }

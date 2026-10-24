@@ -8,6 +8,8 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var sets: [FontSet] = []
     @Published private(set) var importProgress: ImportProgress? = nil
     @Published var message: String? = nil
+    /// Set after a deactivation when some fonts stayed available to apps.
+    @Published var stillActiveReport: StillActiveReport? = nil
 
     @Published var copyOnImport: Bool {
         didSet { UserDefaults.standard.set(copyOnImport, forKey: "copyOnImport") }
@@ -131,7 +133,7 @@ final class LibraryStore: ObservableObject {
                 continue
             }
             do {
-                if current.isActive { try ActivationService.unregister(url, from: current) }
+                if current.isActive { try ActivationService.unregisterEverywhere(url) }
                 try ActivationService.register(url, as: target)
                 setActivation(target, forFile: url)
                 changed += 1
@@ -142,21 +144,54 @@ final class LibraryStore: ObservableObject {
         report(changed: changed, verb: "aktiviert", failures: failures)
     }
 
+    /// Deactivates regardless of the recorded state, so a font whose
+    /// state was recorded wrongly can still be switched off.
     func deactivate(_ ids: Set<UUID>) {
         var failures: [String] = []
         var changed = 0
         for url in files(for: ids) {
-            let current = fonts.first { $0.fileURL == url }?.activation ?? .inactive
-            guard current.isActive else { continue }
+            let wasActive = fonts.first { $0.fileURL == url }?.activation.isActive ?? false
             do {
-                try ActivationService.unregister(url, from: current)
+                let removed = try ActivationService.unregisterEverywhere(url)
+                if removed || wasActive { changed += 1 }
                 setActivation(.inactive, forFile: url)
-                changed += 1
             } catch {
                 failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
         report(changed: changed, verb: "deaktiviert", failures: failures)
+        verifyDeactivation(of: ids)
+    }
+
+    /// Checks shortly afterwards whether the fonts really disappeared
+    /// for apps, and explains why when they did not.
+    private func verifyDeactivation(of ids: Set<UUID>) {
+        let records = fonts.filter { ids.contains($0.id) }
+        guard !records.isEmpty else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard let self else { return }
+            let available = ActivationService.availableFontPaths()
+            var entries: [StillActiveReport.Entry] = []
+            var stuckFiles = Set<URL>()
+
+            for record in records {
+                let ownPath = ActivationService.normalizedPath(record.fileURL)
+                var locations = ActivationService.activeLocations(ofPostScriptName: record.postScriptName)
+                    .filter { ActivationService.normalizedPath($0) != ownPath }
+                if available.contains(ownPath) {
+                    stuckFiles.insert(record.fileURL)
+                    locations.insert(record.fileURL, at: 0)
+                }
+                if !locations.isEmpty {
+                    entries.append(.init(fontName: record.fullName, locations: locations))
+                }
+            }
+            for url in stuckFiles { self.setActivation(.external, forFile: url) }
+            if !entries.isEmpty {
+                self.stillActiveReport = StillActiveReport(entries: entries)
+            }
+        }
     }
 
     func toggleActivation(_ ids: Set<UUID>) {
@@ -193,8 +228,12 @@ final class LibraryStore: ObservableObject {
                 fonts[index].isMissing = missing
                 changed = true
             }
-            if fonts[index].activation.isActive && !available.contains(ActivationService.normalizedPath(url)) {
+            let isAvailable = available.contains(ActivationService.normalizedPath(url))
+            if fonts[index].activation.isActive && !isAvailable {
                 fonts[index].activation = .inactive
+                changed = true
+            } else if !fonts[index].activation.isActive && isAvailable {
+                fonts[index].activation = .external
                 changed = true
             }
         }
@@ -230,9 +269,11 @@ final class LibraryStore: ObservableObject {
             var newRecords: [FontRecord] = []
             var duplicates = 0
             var failures: [String] = []
+            var fromMacOSFolders = 0
             var keys = knownKeys
 
             for (number, file) in files.enumerated() {
+                if ActivationService.isInMacOSFontFolder(file) { fromMacOSFolders += 1 }
                 let faces = FontScanner.scan(file)
                 if faces.isEmpty {
                     failures.append(file.lastPathComponent)
@@ -266,19 +307,24 @@ final class LibraryStore: ObservableObject {
             let added = newRecords
             let skipped = duplicates
             let failed = failures
+            let systemFolderFiles = fromMacOSFolders
             await MainActor.run {
-                self?.finishImport(added: added, duplicates: skipped, failures: failed)
+                self?.finishImport(added: added, duplicates: skipped, failures: failed, fromMacOSFolders: systemFolderFiles)
             }
         }
     }
 
-    private func finishImport(added: [FontRecord], duplicates: Int, failures: [String]) {
+    private func finishImport(added: [FontRecord], duplicates: Int, failures: [String], fromMacOSFolders: Int) {
         fonts.append(contentsOf: added)
         importProgress = nil
         scheduleSave()
+        refreshActivationStates()
         var parts = ["\(added.count) Schriften importiert."]
         if duplicates > 0 { parts.append("\(duplicates) Duplikate übersprungen.") }
         if !failures.isEmpty { parts.append("\(failures.count) Dateien nicht lesbar.") }
+        if fromMacOSFolders > 0 {
+            parts.append("\(fromMacOSFolders) Dateien stammen aus einem Schriftordner von macOS; die Originale dort bleiben aktiv, bis du sie aus dem Ordner entfernst.")
+        }
         message = parts.joined(separator: " ")
     }
 

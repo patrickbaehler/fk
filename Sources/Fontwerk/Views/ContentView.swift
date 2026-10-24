@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @EnvironmentObject private var store: LibraryStore
@@ -48,6 +49,21 @@ struct ContentView: View {
         }
         .onChange(of: sidebarSelection) { _, _ in
             selection.removeAll()
+        }
+        .alert(
+            "Einige Schriften sind weiterhin aktiv",
+            isPresented: Binding(
+                get: { store.stillActiveReport != nil },
+                set: { if !$0 { store.stillActiveReport = nil } }
+            ),
+            presenting: store.stillActiveReport
+        ) { report in
+            Button("Im Finder zeigen") {
+                NSWorkspace.shared.activateFileViewerSelecting(report.allLocations)
+            }
+            Button("OK", role: .cancel) {}
+        } message: { report in
+            Text(report.summary)
         }
     }
 }
