@@ -10,6 +10,8 @@ final class LibraryStore: ObservableObject {
     @Published var message: String? = nil
     /// Set after a deactivation when some fonts stayed available to apps.
     @Published var stillActiveReport: StillActiveReport? = nil
+    @Published var infoAlert: InfoAlert? = nil
+    @Published var showFEXImport = false
 
     @Published var copyOnImport: Bool {
         didSet { UserDefaults.standard.set(copyOnImport, forKey: "copyOnImport") }
@@ -34,7 +36,7 @@ final class LibraryStore: ObservableObject {
 
         copyOnImport = UserDefaults.standard.object(forKey: "copyOnImport") as? Bool ?? true
         let storedScope = UserDefaults.standard.string(forKey: "defaultScope").flatMap(ActivationState.init(rawValue:))
-        defaultScope = (storedScope == nil || storedScope == .inactive) ? .session : storedScope!
+        defaultScope = (storedScope == .persistent) ? .persistent : .session
 
         load()
         refreshActivationStates()
@@ -88,7 +90,7 @@ final class LibraryStore: ObservableObject {
             let cutoff = Date().addingTimeInterval(-14 * 24 * 3600)
             base = fonts.filter { $0.importedAt >= cutoff }
         case .set(let id):
-            let ids = Set(sets.first { $0.id == id }?.fontIDs ?? [])
+            let ids = fontIDs(inSet: id)
             base = fonts.filter { ids.contains($0.id) }
         }
         let query = search.trimmingCharacters(in: .whitespaces)
@@ -118,15 +120,24 @@ final class LibraryStore: ObservableObject {
         return result
     }
 
+    private func stateByFile() -> [URL: ActivationState] {
+        var result: [URL: ActivationState] = [:]
+        for record in fonts where result[record.fileURL] == nil {
+            result[record.fileURL] = record.activation
+        }
+        return result
+    }
+
     // MARK: - Activation
 
-    func activate(_ ids: Set<UUID>, scope: ActivationState? = nil) {
-        let target = scope ?? defaultScope
-        guard target.isActive else { deactivate(ids); return }
+    @discardableResult
+    func activate(_ ids: Set<UUID>, scope: ActivationState? = nil) -> (changed: Int, failures: [String]) {
+        let target = (scope == .persistent || (scope == nil && defaultScope == .persistent)) ? ActivationState.persistent : .session
+        let states = stateByFile()
+        var changes: [URL: ActivationState] = [:]
         var failures: [String] = []
-        var changed = 0
         for url in files(for: ids) {
-            let current = fonts.first { $0.fileURL == url }?.activation ?? .inactive
+            let current = states[url] ?? .inactive
             if current == target { continue }
             guard FileManager.default.fileExists(atPath: url.path) else {
                 failures.append("\(url.lastPathComponent): Datei fehlt")
@@ -135,30 +146,34 @@ final class LibraryStore: ObservableObject {
             do {
                 if current.isActive { try ActivationService.unregisterEverywhere(url) }
                 try ActivationService.register(url, as: target)
-                setActivation(target, forFile: url)
-                changed += 1
+                changes[url] = target
             } catch {
                 failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        report(changed: changed, verb: "aktiviert", failures: failures)
+        apply(changes)
+        report(changed: changes.count, verb: "aktiviert", failures: failures)
+        return (changes.count, failures)
     }
 
     /// Deactivates regardless of the recorded state, so a font whose
     /// state was recorded wrongly can still be switched off.
     func deactivate(_ ids: Set<UUID>) {
-        var failures: [String] = []
+        let states = stateByFile()
+        var changes: [URL: ActivationState] = [:]
         var changed = 0
+        var failures: [String] = []
         for url in files(for: ids) {
-            let wasActive = fonts.first { $0.fileURL == url }?.activation.isActive ?? false
+            let wasActive = states[url]?.isActive ?? false
             do {
                 let removed = try ActivationService.unregisterEverywhere(url)
                 if removed || wasActive { changed += 1 }
-                setActivation(.inactive, forFile: url)
+                changes[url] = .inactive
             } catch {
                 failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
+        apply(changes)
         report(changed: changed, verb: "deaktiviert", failures: failures)
         verifyDeactivation(of: ids)
     }
@@ -166,15 +181,13 @@ final class LibraryStore: ObservableObject {
     /// Checks shortly afterwards whether the fonts really disappeared
     /// for apps, and explains why when they did not.
     private func verifyDeactivation(of ids: Set<UUID>) {
-        let records = fonts.filter { ids.contains($0.id) }
+        let records = Array(fonts.filter { ids.contains($0.id) }.prefix(300))
         guard !records.isEmpty else { return }
-        Task { @MainActor [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             try? await Task.sleep(nanoseconds: 800_000_000)
-            guard let self else { return }
             let available = ActivationService.availableFontPaths()
             var entries: [StillActiveReport.Entry] = []
             var stuckFiles = Set<URL>()
-
             for record in records {
                 let ownPath = ActivationService.normalizedPath(record.fileURL)
                 var locations = ActivationService.activeLocations(ofPostScriptName: record.postScriptName)
@@ -187,9 +200,12 @@ final class LibraryStore: ObservableObject {
                     entries.append(.init(fontName: record.fullName, locations: locations))
                 }
             }
-            for url in stuckFiles { self.setActivation(.external, forFile: url) }
-            if !entries.isEmpty {
-                self.stillActiveReport = StillActiveReport(entries: entries)
+            let stuck = stuckFiles
+            let found = entries
+            await MainActor.run {
+                guard let self else { return }
+                self.apply(Dictionary(uniqueKeysWithValues: stuck.map { ($0, ActivationState.external) }))
+                if !found.isEmpty { self.stillActiveReport = StillActiveReport(entries: found) }
             }
         }
     }
@@ -199,9 +215,10 @@ final class LibraryStore: ObservableObject {
         if anyInactive { activate(ids) } else { deactivate(ids) }
     }
 
-    private func setActivation(_ state: ActivationState, forFile url: URL) {
-        for index in fonts.indices where fonts[index].fileURL == url {
-            fonts[index].activation = state
+    private func apply(_ changes: [URL: ActivationState]) {
+        guard !changes.isEmpty else { return }
+        for index in fonts.indices {
+            if let state = changes[fonts[index].fileURL] { fonts[index].activation = state }
         }
         scheduleSave()
     }
@@ -220,19 +237,25 @@ final class LibraryStore: ObservableObject {
     func refreshActivationStates() {
         let available = ActivationService.availableFontPaths()
         let fm = FileManager.default
+        var pathCache: [URL: (missing: Bool, available: Bool)] = [:]
         var changed = false
         for index in fonts.indices {
             let url = fonts[index].fileURL
-            let missing = !fm.fileExists(atPath: url.path)
-            if fonts[index].isMissing != missing {
-                fonts[index].isMissing = missing
+            let status: (missing: Bool, available: Bool)
+            if let cached = pathCache[url] {
+                status = cached
+            } else {
+                status = (!fm.fileExists(atPath: url.path), available.contains(ActivationService.normalizedPath(url)))
+                pathCache[url] = status
+            }
+            if fonts[index].isMissing != status.missing {
+                fonts[index].isMissing = status.missing
                 changed = true
             }
-            let isAvailable = available.contains(ActivationService.normalizedPath(url))
-            if fonts[index].activation.isActive && !isAvailable {
+            if fonts[index].activation.isActive && !status.available {
                 fonts[index].activation = .inactive
                 changed = true
-            } else if !fonts[index].activation.isActive && isAvailable {
+            } else if !fonts[index].activation.isActive && status.available {
                 fonts[index].activation = .external
                 changed = true
             }
@@ -240,7 +263,7 @@ final class LibraryStore: ObservableObject {
         if changed { scheduleSave() }
     }
 
-    // MARK: - Import
+    // MARK: - Import of font files
 
     func presentImportPanel() {
         let panel = NSOpenPanel()
@@ -328,6 +351,179 @@ final class LibraryStore: ObservableObject {
         message = parts.joined(separator: " ")
     }
 
+    // MARK: - Import of a FontExplorer X library
+
+    func runFEXImport(_ plan: FEXImportPlan, options: FEXImportOptions) {
+        guard importProgress == nil else { return }
+        importProgress = ImportProgress(total: plan.importable.count, done: 0)
+        let destination = managedFontsDirectory
+        var existingByPath: [String: [UUID]] = [:]
+        for record in fonts {
+            existingByPath[ActivationService.normalizedPath(record.fileURL), default: []].append(record.id)
+        }
+        var existingByKey: [String: UUID] = [:]
+        for record in fonts where existingByKey[record.duplicateKey] == nil {
+            existingByKey[record.duplicateKey] = record.id
+        }
+        let knownPaths = existingByPath
+        let knownKeys = existingByKey
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            var newRecords: [FontRecord] = []
+            var containerRecords: [Int64: [UUID]] = [:]
+            var keyToID = knownKeys
+            var failures: [String] = []
+            var copiedFolders: [String: URL] = [:]
+            let total = plan.importable.count
+
+            for (number, container) in plan.importable.enumerated() {
+                defer {
+                    if number % 20 == 0 || number == total - 1 {
+                        let done = number + 1
+                        Task { @MainActor in self?.importProgress?.done = done }
+                    }
+                }
+                guard let source = plan.resolvedURLs[container.id] else { continue }
+                if let ids = knownPaths[ActivationService.normalizedPath(source)] {
+                    containerRecords[container.id] = ids
+                    continue
+                }
+                let faces = FontScanner.scan(source)
+                if faces.isEmpty {
+                    failures.append(source.lastPathComponent)
+                    continue
+                }
+                var ids: [UUID] = []
+                var fresh: [ScannedFace] = []
+                for face in faces {
+                    if let id = keyToID[face.duplicateKey] { ids.append(id) } else { fresh.append(face) }
+                }
+                if !fresh.isEmpty {
+                    var target = source
+                    if options.copyFiles {
+                        do {
+                            if source.path.contains(FEXImporter.fontExplorerLibraryMarker) {
+                                target = try FontScanner.copyFolderIntoLibrary(
+                                    containing: source, familyName: fresh[0].familyName,
+                                    root: destination, copiedFolders: &copiedFolders)
+                            } else {
+                                target = try FontScanner.copyIntoLibrary(source, familyName: fresh[0].familyName, root: destination)
+                            }
+                        } catch {
+                            failures.append(source.lastPathComponent)
+                            continue
+                        }
+                    }
+                    let info = plan.library.faceInfo[container.id] ?? [:]
+                    for face in fresh {
+                        var record = FontRecord(scanned: face, fileURL: target)
+                        if let added = container.addedDate { record.importedAt = added }
+                        if let faceInfo = info[face.postScriptName] {
+                            record.rating = max(0, min(5, faceInfo.rating))
+                            if options.importTags { record.tags = faceInfo.tags }
+                        }
+                        keyToID[face.duplicateKey] = record.id
+                        ids.append(record.id)
+                        newRecords.append(record)
+                    }
+                }
+                containerRecords[container.id] = ids
+            }
+
+            let added = newRecords
+            let mapping = containerRecords
+            let failed = failures
+            await MainActor.run {
+                self?.finishFEXImport(plan, options: options, added: added, containerRecords: mapping, failures: failed)
+            }
+        }
+    }
+
+    private func finishFEXImport(_ plan: FEXImportPlan, options: FEXImportOptions, added: [FontRecord],
+                                 containerRecords: [Int64: [UUID]], failures: [String]) {
+        fonts.append(contentsOf: added)
+
+        // Folders and sets, keeping FontExplorer's hierarchy.
+        var created: [Int64: UUID] = [:]
+        var newSets: [(item: FEXSourceItem, set: FontSet)] = []
+        var programFolderID: UUID? = nil
+        for item in plan.library.items {
+            var fontIDs: [UUID] = []
+            var seen = Set<UUID>()
+            for containerID in item.containerIDs {
+                for id in containerRecords[containerID] ?? [] where seen.insert(id).inserted {
+                    fontIDs.append(id)
+                }
+            }
+            let isFolder = item.type == FEXSourceItem.typeFolder
+            let fallbackName = item.applicationPath.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "Set"
+            let set = FontSet(name: item.title.isEmpty ? fallbackName : item.title, fontIDs: isFolder ? [] : fontIDs,
+                              isFolder: isFolder, applicationPath: item.applicationPath)
+            created[item.serialID] = set.id
+            newSets.append((item, set))
+        }
+        if newSets.contains(where: { $0.item.type == FEXSourceItem.typeApplicationSet }) {
+            let folder = FontSet(name: uniqueSetName("Programm-Sets", parent: nil), isFolder: true)
+            programFolderID = folder.id
+            sets.append(folder)
+        }
+        for entry in newSets {
+            var set = entry.set
+            if entry.item.type == FEXSourceItem.typeApplicationSet {
+                set.parentID = programFolderID
+            } else {
+                set.parentID = created[entry.item.parentSerialID]
+            }
+            sets.append(set)
+        }
+        // Names only need to be unique within the same folder.
+        for entry in newSets {
+            guard let index = sets.firstIndex(where: { $0.id == entry.set.id }) else { continue }
+            let name = sets[index].name
+            let parent = sets[index].parentID
+            if sets.contains(where: { $0.id != entry.set.id && $0.parentID == parent && $0.name == name }) {
+                sets[index].name = uniqueSetName(name, parent: parent)
+            }
+        }
+
+        importProgress = nil
+        scheduleSave()
+        refreshActivationStates()
+
+        var activation: (changed: Int, failures: [String]) = (0, [])
+        if options.restoreActivation {
+            let activeIDs = Set(plan.importable.filter(\.isActive).flatMap { containerRecords[$0.id] ?? [] })
+            if !activeIDs.isEmpty { activation = activate(activeIDs, scope: .persistent) }
+        }
+
+        let folders = newSets.filter { $0.item.type == FEXSourceItem.typeFolder }.count
+        let regularSets = newSets.count - folders
+        var lines = [
+            "\(added.count) Schriften aus \(plan.importable.count - failures.count) Dateien übernommen.",
+            "\(regularSets) Sets und \(folders) Ordner übernommen.",
+        ]
+        if options.restoreActivation {
+            lines.append("\(activation.changed) Dateien wie in FontExplorer dauerhaft aktiviert.")
+        }
+        if plan.skippedSystem + plan.skippedAdobe > 0 {
+            lines.append("Nicht übernommen: \(plan.skippedSystem) Systemschriften und \(plan.skippedAdobe) Adobe Fonts; diese verwalten macOS bzw. Creative Cloud.")
+        }
+        if !plan.missing.isEmpty {
+            lines.append("\(plan.missing.count) Dateien aus der FontExplorer-Bibliothek wurden nicht gefunden.")
+        }
+        if !failures.isEmpty {
+            lines.append("\(failures.count) Dateien konnten nicht gelesen oder kopiert werden: " + failures.prefix(5).joined(separator: ", ") + (failures.count > 5 ? " …" : ""))
+        }
+        if !activation.failures.isEmpty {
+            lines.append("\(activation.failures.count) Dateien liessen sich nicht aktivieren.")
+        }
+        if plan.library.smartSetCount > 0 {
+            lines.append("\(plan.library.smartSetCount) Smart Sets wurden nicht übernommen.")
+        }
+        message = "FontExplorer-Import abgeschlossen."
+        infoAlert = InfoAlert(title: "FontExplorer-Bibliothek übernommen", text: lines.joined(separator: "\n\n"))
+    }
+
     // MARK: - Editing
 
     private func update(_ ids: Set<UUID>, _ change: (inout FontRecord) -> Void) {
@@ -374,21 +570,87 @@ final class LibraryStore: ObservableObject {
         message = "\(ids.count) Schriften aus der Bibliothek entfernt."
     }
 
-    // MARK: - Sets
+    // MARK: - Sets and folders
+
+    func childSets(of parentID: UUID?) -> [FontSet] {
+        sets.filter { $0.parentID == parentID }.sorted { lhs, rhs in
+            if lhs.isFolder != rhs.isFolder { return lhs.isFolder }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    func descendantIDs(of id: UUID) -> Set<UUID> {
+        var result = Set<UUID>()
+        var queue = [id]
+        while let current = queue.popLast() {
+            for child in sets where child.parentID == current && result.insert(child.id).inserted {
+                queue.append(child.id)
+            }
+        }
+        return result
+    }
+
+    /// Fonts of a set; for a folder, the fonts of every set inside it.
+    func fontIDs(inSet setID: UUID) -> Set<UUID> {
+        guard let set = set(withID: setID) else { return [] }
+        guard set.isFolder else { return Set(set.fontIDs) }
+        let inside = descendantIDs(of: setID)
+        return Set(sets.filter { inside.contains($0.id) && !$0.isFolder }.flatMap(\.fontIDs))
+    }
+
+    func set(withID id: UUID) -> FontSet? {
+        sets.first { $0.id == id }
+    }
+
+    /// "Folder › Set" for menus.
+    func displayPath(of set: FontSet) -> String {
+        var names = [set.name]
+        var parent = set.parentID
+        var guardCount = 0
+        while let id = parent, let folder = self.set(withID: id), guardCount < 20 {
+            names.insert(folder.name, at: 0)
+            parent = folder.parentID
+            guardCount += 1
+        }
+        return names.joined(separator: " › ")
+    }
+
+    var regularSetsByPath: [FontSet] {
+        sets.filter { !$0.isFolder }.sorted {
+            displayPath(of: $0).localizedStandardCompare(displayPath(of: $1)) == .orderedAscending
+        }
+    }
+
+    var foldersByPath: [FontSet] {
+        sets.filter(\.isFolder).sorted {
+            displayPath(of: $0).localizedStandardCompare(displayPath(of: $1)) == .orderedAscending
+        }
+    }
 
     @discardableResult
-    func createSet(named name: String, with ids: Set<UUID> = []) -> UUID {
-        let set = FontSet(id: UUID(), name: uniqueSetName(name), fontIDs: fonts.filter { ids.contains($0.id) }.map(\.id))
+    func createSet(named name: String, with ids: Set<UUID> = [], in parentID: UUID? = nil) -> UUID {
+        let set = FontSet(name: uniqueSetName(name, parent: parentID),
+                          fontIDs: fonts.filter { ids.contains($0.id) }.map(\.id),
+                          parentID: parentID)
         sets.append(set)
         scheduleSave()
         return set.id
     }
 
-    private func uniqueSetName(_ name: String) -> String {
-        let base = name.trimmingCharacters(in: .whitespaces).isEmpty ? "Neues Set" : name
+    @discardableResult
+    func createFolder(named name: String, in parentID: UUID? = nil) -> UUID {
+        let folder = FontSet(name: uniqueSetName(name, parent: parentID), parentID: parentID, isFolder: true)
+        sets.append(folder)
+        scheduleSave()
+        return folder.id
+    }
+
+    private func uniqueSetName(_ name: String, parent: UUID?) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        let base = trimmed.isEmpty ? "Neues Set" : trimmed
         var candidate = base
         var counter = 2
-        while sets.contains(where: { $0.name == candidate }) {
+        while sets.contains(where: { $0.parentID == parent && $0.name == candidate }) {
             candidate = "\(base) \(counter)"
             counter += 1
         }
@@ -398,18 +660,38 @@ final class LibraryStore: ObservableObject {
     func renameSet(_ id: UUID, to name: String) {
         guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        sets[index].name = trimmed
+        guard !trimmed.isEmpty, trimmed != sets[index].name else { return }
+        sets[index].name = uniqueSetName(trimmed, parent: sets[index].parentID)
         scheduleSave()
     }
 
+    /// Moves a set or folder into another folder (nil = top level).
+    func moveSet(_ id: UUID, to parentID: UUID?) {
+        guard let index = sets.firstIndex(where: { $0.id == id }) else { return }
+        if let parentID {
+            guard parentID != id, !descendantIDs(of: id).contains(parentID),
+                  set(withID: parentID)?.isFolder == true else { return }
+        }
+        sets[index].parentID = parentID
+        sets[index].name = uniqueSetName(sets[index].name, parent: parentID)
+        scheduleSave()
+    }
+
+    /// Deletes a set. Deleting a folder keeps its contents and moves them
+    /// one level up.
     func deleteSet(_ id: UUID) {
+        guard let set = set(withID: id) else { return }
+        if set.isFolder {
+            for index in sets.indices where sets[index].parentID == id {
+                sets[index].parentID = set.parentID
+            }
+        }
         sets.removeAll { $0.id == id }
         scheduleSave()
     }
 
     func add(_ ids: Set<UUID>, toSet setID: UUID) {
-        guard let index = sets.firstIndex(where: { $0.id == setID }) else { return }
+        guard let index = sets.firstIndex(where: { $0.id == setID }), !sets[index].isFolder else { return }
         let existing = Set(sets[index].fontIDs)
         let additions = fonts.map(\.id).filter { ids.contains($0) && !existing.contains($0) }
         sets[index].fontIDs.append(contentsOf: additions)
@@ -420,13 +702,5 @@ final class LibraryStore: ObservableObject {
         guard let index = sets.firstIndex(where: { $0.id == setID }) else { return }
         sets[index].fontIDs.removeAll { ids.contains($0) }
         scheduleSave()
-    }
-
-    func fontIDs(inSet setID: UUID) -> Set<UUID> {
-        Set(sets.first { $0.id == setID }?.fontIDs ?? [])
-    }
-
-    func set(withID id: UUID) -> FontSet? {
-        sets.first { $0.id == id }
     }
 }

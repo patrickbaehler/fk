@@ -16,6 +16,22 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 420, ideal: 600)
         } detail: {
             PreviewPane(fontIDs: selection)
+                .alert(
+                    store.infoAlert?.title ?? "",
+                    isPresented: Binding(
+                        get: { store.infoAlert != nil },
+                        set: { if !$0 { store.infoAlert = nil } }
+                    ),
+                    presenting: store.infoAlert
+                ) { _ in
+                    Button("OK", role: .cancel) {}
+                } message: { alert in
+                    Text(alert.text)
+                }
+        }
+        .sheet(isPresented: $store.showFEXImport) {
+            FEXImportSheet()
+                .environmentObject(store)
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Schriften suchen")
         .toolbar {

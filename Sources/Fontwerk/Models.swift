@@ -71,11 +71,48 @@ struct FontRecord: Identifiable, Codable, Hashable {
     var foundryText: String { foundry ?? "" }
 }
 
-/// A user-defined collection of fonts.
+/// A user-defined collection of fonts, or a folder that groups sets.
+/// A folder shows the fonts of every set inside it.
 struct FontSet: Identifiable, Codable, Hashable {
     var id: UUID
     var name: String
     var fontIDs: [UUID]
+    var parentID: UUID?
+    var isFolder: Bool
+    /// For sets that belong to a program (FontExplorer "Application Sets").
+    var applicationPath: String?
+
+    init(id: UUID = UUID(), name: String, fontIDs: [UUID] = [], parentID: UUID? = nil,
+         isFolder: Bool = false, applicationPath: String? = nil) {
+        self.id = id
+        self.name = name
+        self.fontIDs = fontIDs
+        self.parentID = parentID
+        self.isFolder = isFolder
+        self.applicationPath = applicationPath
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, fontIDs, parentID, isFolder, applicationPath
+    }
+
+    // Libraries written by version 0.1 have no folder fields.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        fontIDs = try container.decodeIfPresent([UUID].self, forKey: .fontIDs) ?? []
+        parentID = try container.decodeIfPresent(UUID.self, forKey: .parentID)
+        isFolder = try container.decodeIfPresent(Bool.self, forKey: .isFolder) ?? false
+        applicationPath = try container.decodeIfPresent(String.self, forKey: .applicationPath)
+    }
+}
+
+/// A titled message shown as an alert.
+struct InfoAlert: Identifiable {
+    let id = UUID()
+    var title: String
+    var text: String
 }
 
 /// What is written to library.json.

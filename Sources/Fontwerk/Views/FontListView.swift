@@ -88,13 +88,14 @@ struct FontListView: View {
             Button("Deaktivieren") { store.deactivate(ids) }
             Divider()
             Menu("Zu Set hinzufügen") {
-                ForEach(store.sets) { set in
-                    Button(set.name) { store.add(ids, toSet: set.id) }
+                let targets = store.regularSetsByPath
+                ForEach(targets) { set in
+                    Button(store.displayPath(of: set)) { store.add(ids, toSet: set.id) }
                 }
-                if !store.sets.isEmpty { Divider() }
+                if !targets.isEmpty { Divider() }
                 Button("Neues Set aus Auswahl") { store.createSet(named: "Neues Set", with: ids) }
             }
-            if case .set(let setID) = source {
+            if case .set(let setID) = source, store.set(withID: setID)?.isFolder == false {
                 Button("Aus diesem Set entfernen") { store.remove(ids, fromSet: setID) }
             }
             Menu("Bewertung") {
@@ -122,6 +123,7 @@ struct FontListView: View {
             Text("Importiere Schriftdateien oder ganze Ordner, oder zieh sie hierher.")
         } actions: {
             Button("Schriften importieren …") { store.presentImportPanel() }
+            Button("FontExplorer-Bibliothek übernehmen …") { store.showFEXImport = true }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

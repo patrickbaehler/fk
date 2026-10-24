@@ -105,6 +105,34 @@ enum FontScanner {
         try fm.copyItem(at: file, to: target)
         return target
     }
+
+    /// Copies the whole folder that contains a font, so companion files
+    /// (PostScript outlines, metrics, resource forks) stay together.
+    /// FontExplorer keeps every font file in a folder of its own.
+    /// Each source folder is copied only once.
+    static func copyFolderIntoLibrary(containing file: URL, familyName: String, root: URL,
+                                      copiedFolders: inout [String: URL]) throws -> URL {
+        let sourceFolder = file.deletingLastPathComponent()
+        if let existing = copiedFolders[sourceFolder.path] {
+            return existing.appendingPathComponent(file.lastPathComponent)
+        }
+        let fm = FileManager.default
+        let first = familyName.trimmingCharacters(in: .whitespaces).first.map { String($0).uppercased() } ?? "#"
+        let bucket = first.rangeOfCharacter(from: .letters) != nil ? first : "#"
+        let bucketFolder = root.appendingPathComponent(bucket, isDirectory: true)
+        try fm.createDirectory(at: bucketFolder, withIntermediateDirectories: true)
+
+        let baseName = sourceFolder.lastPathComponent
+        var target = bucketFolder.appendingPathComponent(baseName, isDirectory: true)
+        var counter = 2
+        while fm.fileExists(atPath: target.path) {
+            target = bucketFolder.appendingPathComponent("\(baseName) \(counter)", isDirectory: true)
+            counter += 1
+        }
+        try fm.copyItem(at: sourceFolder, to: target)
+        copiedFolders[sourceFolder.path] = target
+        return target.appendingPathComponent(file.lastPathComponent)
+    }
 }
 
 /// Creates fonts for previews straight from the file, so inactive

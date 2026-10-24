@@ -19,6 +19,7 @@ struct FontwerkApp: App {
             CommandGroup(after: .newItem) {
                 Button("Schriften importieren …") { store.presentImportPanel() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
+                Button("FontExplorer-Bibliothek übernehmen …") { store.showFEXImport = true }
             }
         }
 
