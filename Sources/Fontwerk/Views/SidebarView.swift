@@ -1,10 +1,14 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct SidebarView: View {
     @EnvironmentObject private var store: LibraryStore
     @Binding var selection: SidebarItem?
 
     @State private var expandedFolders: Set<UUID> = []
+    @State private var editingSmartSet: SmartSet? = nil
+    @State private var deletingSmartSetID: UUID? = nil
     @State private var renamingSetID: UUID? = nil
     @State private var nameField = ""
     @State private var showRename = false
@@ -21,10 +25,35 @@ struct SidebarView: View {
                 if store.count(.missing) > 0 {
                     row("Fehlende Dateien", icon: "exclamationmark.triangle", item: .missing)
                 }
+                Label("Konflikte", systemImage: "exclamationmark.2")
+                    .badge(store.libraryDuplicateGroupCount)
+                    .tag(SidebarItem.conflicts)
             }
 
             Section("Sets") {
                 SetTreeRows(parentID: nil, expanded: $expandedFolders, actions: actions)
+            }
+
+            if !store.smartSets.isEmpty {
+                Section("Smart Sets") {
+                    ForEach(store.smartSets) { smartSet in
+                        Label(smartSet.name, systemImage: "line.3.horizontal.decrease.circle")
+                            .badge(store.matchingRecords(for: smartSet).count)
+                            .tag(SidebarItem.smartSet(smartSet.id))
+                            .contextMenu {
+                                Button("Bearbeiten …") { editingSmartSet = smartSet }
+                                Divider()
+                                Button("Alle aktivieren") {
+                                    store.activate(Set(store.matchingRecords(for: smartSet).map(\.id)))
+                                }
+                                Button("Alle deaktivieren") {
+                                    store.deactivate(Set(store.matchingRecords(for: smartSet).map(\.id)))
+                                }
+                                Divider()
+                                Button("Smart Set löschen …", role: .destructive) { deletingSmartSetID = smartSet.id }
+                            }
+                    }
+                }
             }
         }
         .listStyle(.sidebar)
@@ -33,6 +62,8 @@ struct SidebarView: View {
                 Menu {
                     Button("Neues Set") { newSet(in: selectedFolderID) }
                     Button("Neuer Ordner") { newFolder(in: selectedFolderID) }
+                    Button("Neues Smart Set …") { editingSmartSet = SmartSet(name: "Neues Smart Set") }
+                    Button("Neues Programm-Set …") { newProgramSet(in: selectedFolderID) }
                 } label: {
                     Label("Neu", systemImage: "plus")
                 }
@@ -66,6 +97,24 @@ struct SidebarView: View {
                  ? "Die Sets im Ordner bleiben erhalten und rücken eine Ebene nach oben. Die Schriften bleiben in der Bibliothek."
                  : "Die Schriften bleiben in der Bibliothek, nur das Set wird entfernt.")
         }
+        .confirmationDialog(
+            "Smart Set löschen?",
+            isPresented: Binding(get: { deletingSmartSetID != nil }, set: { if !$0 { deletingSmartSetID = nil } })
+        ) {
+            Button("Löschen", role: .destructive) {
+                if let id = deletingSmartSetID {
+                    if selection == .smartSet(id) { selection = .all }
+                    store.deleteSmartSet(id)
+                }
+                deletingSmartSetID = nil
+            }
+        } message: {
+            Text("Nur die Regeln werden gelöscht, die Schriften bleiben in der Bibliothek.")
+        }
+        .sheet(item: $editingSmartSet) { smartSet in
+            SmartSetEditor(draft: smartSet)
+                .environmentObject(store)
+        }
     }
 
     private var actions: SetRowActions {
@@ -77,8 +126,31 @@ struct SidebarView: View {
             },
             delete: { set in deletingSetID = set.id },
             newSet: { parent in newSet(in: parent) },
-            newFolder: { parent in newFolder(in: parent) }
+            newFolder: { parent in newFolder(in: parent) },
+            assignApplication: { set in
+                if let url = Self.chooseApplication() {
+                    store.assignApplication(url.path, toSet: set.id)
+                }
+            }
         )
+    }
+
+    private func newProgramSet(in parent: UUID?) {
+        guard let url = Self.chooseApplication() else { return }
+        let id = store.createProgramSet(for: url, in: parent)
+        if let parent { expandedFolders.insert(parent) }
+        selection = .set(id)
+    }
+
+    static func chooseApplication() -> URL? {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.message = "Programm wählen, bei dessen Start das Set aktiviert wird"
+        panel.prompt = "Zuordnen"
+        return panel.runModal() == .OK ? panel.url : nil
     }
 
     /// New items go into the selected folder, or next to the selected set.
@@ -127,6 +199,7 @@ struct SetRowActions {
     var delete: (FontSet) -> Void
     var newSet: (UUID?) -> Void
     var newFolder: (UUID?) -> Void
+    var assignApplication: (FontSet) -> Void
 }
 
 /// One level of the set tree; folders contain another level.
@@ -158,7 +231,7 @@ struct SetTreeRows: View {
     private func label(for set: FontSet) -> some View {
         Label(set.name, systemImage: icon(for: set))
             .badge(store.fontIDs(inSet: set.id).count)
-            .help(set.applicationPath ?? "")
+            .help(set.applicationPath.map { "Wird beim Start von \(FileManager.default.displayName(atPath: $0)) aktiviert" } ?? "")
             .tag(SidebarItem.set(set.id))
             .contextMenu { menu(for: set) }
     }
@@ -184,6 +257,14 @@ struct SetTreeRows: View {
             Divider()
         }
         Button("Umbenennen …") { actions.rename(set) }
+        if !set.isFolder {
+            Button(set.applicationPath == nil ? "Programm zuordnen …" : "Anderes Programm zuordnen …") {
+                actions.assignApplication(set)
+            }
+            if set.applicationPath != nil {
+                Button("Programmzuordnung entfernen") { store.assignApplication(nil, toSet: set.id) }
+            }
+        }
         Menu("Verschieben nach") {
             Button("Oberste Ebene") { store.moveSet(set.id, to: nil) }
                 .disabled(set.parentID == nil)

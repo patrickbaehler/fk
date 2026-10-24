@@ -120,6 +120,26 @@ struct LibraryData: Codable {
     var version: Int
     var fonts: [FontRecord]
     var sets: [FontSet]
+    var smartSets: [SmartSet]
+
+    init(version: Int, fonts: [FontRecord], sets: [FontSet], smartSets: [SmartSet]) {
+        self.version = version
+        self.fonts = fonts
+        self.sets = sets
+        self.smartSets = smartSets
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case version, fonts, sets, smartSets
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        fonts = try container.decodeIfPresent([FontRecord].self, forKey: .fonts) ?? []
+        sets = try container.decodeIfPresent([FontSet].self, forKey: .sets) ?? []
+        smartSets = try container.decodeIfPresent([SmartSet].self, forKey: .smartSets) ?? []
+    }
 }
 
 /// Fonts that stayed available to apps after a deactivation, with the
@@ -165,5 +185,7 @@ enum SidebarItem: Hashable {
     case favorites
     case recent
     case missing
+    case conflicts
     case set(UUID)
+    case smartSet(UUID)
 }

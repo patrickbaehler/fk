@@ -17,6 +17,9 @@ struct SettingsView: View {
                     Text("Bis zum Abmelden").tag(ActivationState.session)
                     Text("Dauerhaft").tag(ActivationState.persistent)
                 }
+                Toggle("Programm-Sets beim Start des Programms aktivieren", isOn: $store.autoActivateProgramSets)
+                Text("Beim Beenden des Programms deaktiviert Fontwerk die Schriften wieder, sofern du sie nicht inzwischen dauerhaft aktiviert hast.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Darstellung") {
                 Toggle("Schriftnamen in der Liste in ihrer eigenen Schrift zeigen", isOn: $wysiwygNames)

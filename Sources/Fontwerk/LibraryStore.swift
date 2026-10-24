@@ -6,6 +6,7 @@ import CoreText
 final class LibraryStore: ObservableObject {
     @Published private(set) var fonts: [FontRecord] = []
     @Published private(set) var sets: [FontSet] = []
+    @Published private(set) var smartSets: [SmartSet] = []
     @Published private(set) var importProgress: ImportProgress? = nil
     @Published var message: String? = nil
     /// Set after a deactivation when some fonts stayed available to apps.
@@ -19,11 +20,17 @@ final class LibraryStore: ObservableObject {
     @Published var defaultScope: ActivationState {
         didSet { UserDefaults.standard.set(defaultScope.rawValue, forKey: "defaultScope") }
     }
+    @Published var autoActivateProgramSets: Bool {
+        didSet { UserDefaults.standard.set(autoActivateProgramSets, forKey: "autoActivateProgramSets") }
+    }
 
     let supportDirectory: URL
     let managedFontsDirectory: URL
     private let libraryFile: URL
     private var saveTask: Task<Void, Never>?
+    /// Program set → files Fontwerk activated because the program started.
+    private var autoActivatedFiles: [UUID: Set<URL>] = [:]
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     init() {
         let fm = FileManager.default
@@ -37,9 +44,11 @@ final class LibraryStore: ObservableObject {
         copyOnImport = UserDefaults.standard.object(forKey: "copyOnImport") as? Bool ?? true
         let storedScope = UserDefaults.standard.string(forKey: "defaultScope").flatMap(ActivationState.init(rawValue:))
         defaultScope = (storedScope == .persistent) ? .persistent : .session
+        autoActivateProgramSets = UserDefaults.standard.object(forKey: "autoActivateProgramSets") as? Bool ?? true
 
         load()
         refreshActivationStates()
+        startWatchingApplications()
     }
 
     // MARK: - Persistence
@@ -52,6 +61,7 @@ final class LibraryStore: ObservableObject {
             let library = try decoder.decode(LibraryData.self, from: data)
             fonts = library.fonts
             sets = library.sets
+            smartSets = library.smartSets
         } catch {
             let backup = libraryFile.deletingLastPathComponent()
                 .appendingPathComponent("library-defekt-\(Int(Date().timeIntervalSince1970)).json")
@@ -62,7 +72,7 @@ final class LibraryStore: ObservableObject {
 
     private func scheduleSave() {
         saveTask?.cancel()
-        let snapshot = LibraryData(version: 1, fonts: fonts, sets: sets)
+        let snapshot = LibraryData(version: 1, fonts: fonts, sets: sets, smartSets: smartSets)
         let url = libraryFile
         saveTask = Task.detached(priority: .utility) {
             try? await Task.sleep(nanoseconds: 400_000_000)
@@ -92,6 +102,12 @@ final class LibraryStore: ObservableObject {
         case .set(let id):
             let ids = fontIDs(inSet: id)
             base = fonts.filter { ids.contains($0.id) }
+        case .smartSet(let id):
+            base = smartSet(withID: id).map { matchingRecords(for: $0) } ?? []
+        case .conflicts:
+            let groups = conflictGroups(external: [:]).filter(\.hasLibraryDuplicates)
+            let ids = Set(groups.flatMap { $0.records.map(\.id) })
+            base = fonts.filter { ids.contains($0.id) }
         }
         let query = search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return base }
@@ -120,7 +136,7 @@ final class LibraryStore: ObservableObject {
         return result
     }
 
-    private func stateByFile() -> [URL: ActivationState] {
+    func stateByFile() -> [URL: ActivationState] {
         var result: [URL: ActivationState] = [:]
         for record in fonts where result[record.fileURL] == nil {
             result[record.fileURL] = record.activation
@@ -158,7 +174,7 @@ final class LibraryStore: ObservableObject {
 
     /// Deactivates regardless of the recorded state, so a font whose
     /// state was recorded wrongly can still be switched off.
-    func deactivate(_ ids: Set<UUID>) {
+    func deactivate(_ ids: Set<UUID>, verify: Bool = true) {
         let states = stateByFile()
         var changes: [URL: ActivationState] = [:]
         var changed = 0
@@ -175,7 +191,7 @@ final class LibraryStore: ObservableObject {
         }
         apply(changes)
         report(changed: changed, verb: "deaktiviert", failures: failures)
-        verifyDeactivation(of: ids)
+        if verify { verifyDeactivation(of: ids) }
     }
 
     /// Checks shortly afterwards whether the fonts really disappeared
@@ -553,8 +569,8 @@ final class LibraryStore: ObservableObject {
 
     /// Removes fonts from the library. Files Fontwerk copied into its own
     /// folder go to the Trash once no record uses them any more.
-    func remove(_ ids: Set<UUID>) {
-        deactivate(ids)
+    func remove(_ ids: Set<UUID>, quiet: Bool = false) {
+        deactivate(ids, verify: !quiet)
         let removedFiles = Set(files(for: ids))
         fonts.removeAll { ids.contains($0.id) }
         for index in sets.indices {
@@ -702,5 +718,174 @@ final class LibraryStore: ObservableObject {
         guard let index = sets.firstIndex(where: { $0.id == setID }) else { return }
         sets[index].fontIDs.removeAll { ids.contains($0) }
         scheduleSave()
+    }
+
+    // MARK: - Smart sets
+
+    func smartSet(withID id: UUID) -> SmartSet? {
+        smartSets.first { $0.id == id }
+    }
+
+    func matchingRecords(for smartSet: SmartSet) -> [FontRecord] {
+        var members: [UUID: Set<UUID>] = [:]
+        for id in smartSet.referencedSetIDs { members[id] = fontIDs(inSet: id) }
+        let now = Date()
+        return fonts.filter { smartSet.matches($0, now: now, setMembers: members) }
+    }
+
+    func saveSmartSet(_ smartSet: SmartSet) {
+        var cleaned = smartSet
+        let trimmed = cleaned.name.trimmingCharacters(in: .whitespaces)
+        cleaned.name = trimmed.isEmpty ? "Smart Set" : trimmed
+        if let index = smartSets.firstIndex(where: { $0.id == cleaned.id }) {
+            smartSets[index] = cleaned
+        } else {
+            smartSets.append(cleaned)
+        }
+        smartSets.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        scheduleSave()
+    }
+
+    func deleteSmartSet(_ id: UUID) {
+        smartSets.removeAll { $0.id == id }
+        scheduleSave()
+    }
+
+    // MARK: - Conflicts
+
+    /// Keeps one record per decision and removes the others. Set
+    /// memberships, ratings, favorites and tags move to the kept record;
+    /// if a removed duplicate was active, the kept one gets activated.
+    func resolveConflicts(_ decisions: [(keep: UUID, remove: Set<UUID>)]) {
+        let byID = Dictionary(fonts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var replacement: [UUID: UUID] = [:]
+        var reactivate: [UUID: ActivationState] = [:]
+
+        for decision in decisions {
+            guard let keep = byID[decision.keep],
+                  let keepIndex = fonts.firstIndex(where: { $0.id == decision.keep }) else { continue }
+            var wanted = keep.activation
+            for id in decision.remove where id != keep.id {
+                guard let other = byID[id], other.fileURL != keep.fileURL else { continue }
+                replacement[id] = keep.id
+                fonts[keepIndex].rating = max(fonts[keepIndex].rating, other.rating)
+                fonts[keepIndex].isFavorite = fonts[keepIndex].isFavorite || other.isFavorite
+                for tag in other.tags where !fonts[keepIndex].tags.contains(tag) {
+                    fonts[keepIndex].tags.append(tag)
+                }
+                if other.activation == .persistent {
+                    wanted = .persistent
+                } else if other.activation == .session && !wanted.isActive {
+                    wanted = .session
+                }
+            }
+            if wanted != keep.activation, wanted == .session || wanted == .persistent, keep.activation != .persistent {
+                reactivate[keep.id] = wanted
+            }
+        }
+        guard !replacement.isEmpty else { return }
+
+        for index in sets.indices where !sets[index].isFolder {
+            var seen = Set<UUID>()
+            var updated: [UUID] = []
+            for id in sets[index].fontIDs {
+                let mapped = replacement[id] ?? id
+                if seen.insert(mapped).inserted { updated.append(mapped) }
+            }
+            sets[index].fontIDs = updated
+        }
+
+        let removed = Set(replacement.keys)
+        remove(removed, quiet: true)
+        for state in [ActivationState.session, .persistent] {
+            let ids = Set(reactivate.filter { $0.value == state }.map(\.key))
+            if !ids.isEmpty { activate(ids, scope: state) }
+        }
+        message = "\(removed.count) doppelte Schriften entfernt."
+    }
+
+    // MARK: - Program sets
+
+    func assignApplication(_ path: String?, toSet setID: UUID) {
+        guard let index = sets.firstIndex(where: { $0.id == setID }), !sets[index].isFolder else { return }
+        sets[index].applicationPath = path
+        scheduleSave()
+    }
+
+    @discardableResult
+    func createProgramSet(for applicationURL: URL, in parentID: UUID?) -> UUID {
+        let name = FileManager.default.displayName(atPath: applicationURL.path)
+            .replacingOccurrences(of: ".app", with: "")
+        let id = createSet(named: name, in: parentID)
+        assignApplication(applicationURL.path, toSet: id)
+        return id
+    }
+
+    private func programSets(forApplicationAt path: String) -> [FontSet] {
+        let wanted = ActivationService.normalizedPath(URL(fileURLWithPath: path))
+        let wantedName = URL(fileURLWithPath: path).lastPathComponent
+        let exact = sets.filter { set in
+            guard let appPath = set.applicationPath, !set.isFolder else { return false }
+            return ActivationService.normalizedPath(URL(fileURLWithPath: appPath)) == wanted
+        }
+        if !exact.isEmpty { return exact }
+        // The program may have moved, e.g. after an update to a new folder.
+        return sets.filter { set in
+            guard let appPath = set.applicationPath, !set.isFolder else { return false }
+            return URL(fileURLWithPath: appPath).lastPathComponent == wantedName
+        }
+    }
+
+    private func startWatchingApplications() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard let path = app?.bundleURL?.path else { return }
+            let name = app?.localizedName ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+            Task { @MainActor in self?.applicationLaunched(at: path, name: name) }
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard let path = app?.bundleURL?.path else { return }
+            Task { @MainActor in self?.applicationTerminated(at: path) }
+        })
+        // Programs that are already running when Fontwerk starts.
+        for app in NSWorkspace.shared.runningApplications {
+            guard let path = app.bundleURL?.path else { continue }
+            applicationLaunched(at: path, name: app.localizedName ?? "", announce: false)
+        }
+    }
+
+    private func applicationLaunched(at path: String, name: String, announce: Bool = true) {
+        guard autoActivateProgramSets else { return }
+        for set in programSets(forApplicationAt: path) {
+            let inactive = Set(records(withIDs: Set(set.fontIDs)).filter { !$0.activation.isActive }.map(\.id))
+            guard !inactive.isEmpty else { continue }
+            let before = stateByFile()
+            activate(inactive, scope: .session)
+            let newlyActive = stateByFile().filter { $0.value == .session && !(before[$0.key]?.isActive ?? false) }.map(\.key)
+            autoActivatedFiles[set.id, default: []].formUnion(newlyActive)
+            if announce { message = "„\(set.name)“ für \(name) aktiviert." }
+        }
+    }
+
+    private func applicationTerminated(at path: String) {
+        for set in programSets(forApplicationAt: path) {
+            guard let files = autoActivatedFiles.removeValue(forKey: set.id) else { continue }
+            let stillNeeded = autoActivatedFiles.values.reduce(into: Set<URL>()) { $0.formUnion($1) }
+            let states = stateByFile()
+            // Only files that are still active "until logout", i.e. the
+            // user has not switched them to permanent in the meantime.
+            let toDeactivate = files.filter { !stillNeeded.contains($0) && states[$0] == .session }
+            let ids = Set(fonts.filter { toDeactivate.contains($0.fileURL) }.map(\.id))
+            if !ids.isEmpty {
+                deactivate(ids, verify: false)
+                message = "„\(set.name)“ deaktiviert, das Programm wurde beendet."
+            }
+        }
     }
 }

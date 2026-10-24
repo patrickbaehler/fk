@@ -21,6 +21,8 @@ struct FontwerkApp: App {
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                 Button("FontExplorer-Bibliothek übernehmen …") { store.showFEXImport = true }
             }
+            // Printing runs through the toolbar button (⌘P), which knows the selection.
+            CommandGroup(replacing: .printItem) {}
         }
 
         Settings {

@@ -12,8 +12,14 @@ struct ContentView: View {
             SidebarView(selection: $sidebarSelection)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } content: {
-            FontListView(source: sidebarSelection ?? .all, search: search, selection: $selection)
-                .navigationSplitViewColumnWidth(min: 420, ideal: 600)
+            Group {
+                if sidebarSelection == .conflicts {
+                    ConflictsView(selection: $selection)
+                } else {
+                    FontListView(source: sidebarSelection ?? .all, search: search, selection: $selection)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 420, ideal: 600)
         } detail: {
             PreviewPane(fontIDs: selection)
                 .alert(
@@ -61,6 +67,14 @@ struct ContentView: View {
                 }
                 .disabled(selection.isEmpty)
                 .help("Auswahl deaktivieren")
+
+                Button {
+                    printSampleSheet()
+                } label: {
+                    Label("Drucken", systemImage: "printer")
+                }
+                .keyboardShortcut("p", modifiers: .command)
+                .help("Musterblatt der Auswahl drucken (ohne Auswahl: alle Schriften der Liste)")
             }
         }
         .onChange(of: sidebarSelection) { _, _ in
@@ -81,5 +95,18 @@ struct ContentView: View {
         } message: { report in
             Text(report.summary)
         }
+    }
+
+    private func printSampleSheet() {
+        let records: [FontRecord]
+        if selection.isEmpty {
+            records = store.records(in: sidebarSelection ?? .all, matching: search)
+        } else {
+            records = store.records(withIDs: selection)
+        }
+        let sorted = records.sorted { ($0.familyName, $0.styleName) < ($1.familyName, $1.styleName) }
+        let sample = UserDefaults.standard.string(forKey: "previewText")
+            ?? "Franz jagt im komplett verwahrlosten Taxi quer durch Bayern"
+        SampleSheetPrinter.print(sorted, sampleText: sample)
     }
 }
