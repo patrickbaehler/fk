@@ -10,6 +10,7 @@ struct ConflictsView: View {
     @State private var external: [String: [URL]] = [:]
     @State private var checkingExternal = true
     @State private var confirmAutomatic = false
+    @State private var confirmHide = false
 
     var body: some View {
         let groups = store.conflictGroups(external: external)
@@ -45,15 +46,26 @@ struct ConflictsView: View {
         }
         .task { await loadExternal() }
         .confirmationDialog(
-            "Doppelte Schriften automatisch bereinigen?",
+            "Doppelte Schriften entfernen?",
             isPresented: $confirmAutomatic
         ) {
-            Button("\(decisions.reduce(0) { $0 + $1.remove.count }) Duplikate entfernen", role: .destructive) {
+            Button("\(store.affectedCount(decisions)) Duplikate entfernen", role: .destructive) {
                 store.resolveConflicts(decisions)
                 selection.removeAll()
             }
         } message: {
-            Text("Pro Schrift bleibt die neueste Version erhalten. Sets, Bewertungen und Tags gehen auf sie über. Dateien in Fontwerks Ordner kommen in den Papierkorb.")
+            Text("Pro Schrift bleibt die empfohlene Fassung erhalten (OpenType vor TrueType, sonst die neueste Version). Sets, Bewertungen und Tags gehen auf sie über. Die übrigen Dateien in Fontwerks Ordner kommen in den Papierkorb.")
+        }
+        .confirmationDialog(
+            "Nur die bevorzugte Fassung anzeigen?",
+            isPresented: $confirmHide
+        ) {
+            Button("\(store.affectedCount(decisions)) Fassungen ausblenden") {
+                store.hideConflicts(decisions.map { (keep: $0.keep, hide: $0.remove) })
+                selection.removeAll()
+            }
+        } message: {
+            Text("Pro Schrift bleibt die OpenType-Fassung sichtbar, ohne OpenType die TrueType-Fassung. PostScript-Type-1-Schriften, Koffer und ältere Versionen werden deaktiviert und ausgeblendet. Alle Dateien bleiben auf dem Computer; unter «Ausgeblendet» kannst du sie wieder einblenden.")
         }
     }
 
@@ -62,13 +74,17 @@ struct ConflictsView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("\(groups.filter(\.hasLibraryDuplicates).count) Schriften mehrfach in der Bibliothek, \(groups.filter { !$0.externalLocations.isEmpty }.count) auch ausserhalb von Fontwerk")
                     .font(.callout)
-                Text("Gleichnamige Schriften stören sich gegenseitig. Grün markiert ist die empfohlene Fassung.")
+                Text("Gleichnamige Schriften stören sich gegenseitig. Grün markiert ist die bevorzugte Fassung: OpenType vor TrueType, sonst die neueste Version.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
             if checkingExternal { ProgressView().controlSize(.small) }
-            Button("Automatisch bereinigen …") { confirmAutomatic = true }
-                .disabled(decisions.isEmpty)
+            Menu("Automatisch bereinigen") {
+                Button("Nur OpenType anzeigen, andere Fassungen ausblenden …") { confirmHide = true }
+                Button("Duplikate aus der Bibliothek entfernen …") { confirmAutomatic = true }
+            }
+            .fixedSize()
+            .disabled(decisions.isEmpty)
         }
         .padding(10)
     }
@@ -76,6 +92,11 @@ struct ConflictsView: View {
     @ViewBuilder
     private func menu(for record: FontRecord, in group: ConflictGroup) -> some View {
         if group.hasLibraryDuplicates {
+            Button("Nur diese Fassung zeigen, andere ausblenden") {
+                let others = Set(group.records.filter { $0.id != record.id && $0.fileURL != record.fileURL }.map(\.id))
+                store.hideConflicts([(keep: record.id, hide: others)])
+                selection.removeAll()
+            }
             Button("Diese behalten, andere entfernen") {
                 let others = Set(group.records.filter { $0.id != record.id && $0.fileURL != record.fileURL }.map(\.id))
                 store.resolveConflicts([(keep: record.id, remove: others)])
@@ -140,7 +161,8 @@ private struct ConflictRecordRow: View {
                             .foregroundStyle(.green)
                     }
                 }
-                Text([record.versionText, record.format, "\(record.glyphCount) Glyphen",
+                Text([FormatPreference.label(record), record.versionText, record.fileURL.pathExtension.lowercased(),
+                      "\(record.glyphCount) Glyphen",
                       ByteCountFormatter.string(fromByteCount: record.fileSize, countStyle: .file)]
                         .filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary)

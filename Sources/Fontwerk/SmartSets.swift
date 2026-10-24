@@ -27,6 +27,8 @@ enum SmartOperator: String, Codable, CaseIterable, Identifiable {
         case (.active, .isFalse): return "ist inaktiv"
         case (.favorite, .isTrue): return "ist Favorit"
         case (.favorite, .isFalse): return "ist kein Favorit"
+        case (.variable, .isTrue): return "ist variabel"
+        case (.variable, .isFalse): return "ist nicht variabel"
         case (.importedDaysAgo, .atMost): return "vor höchstens"
         case (.importedDaysAgo, .atLeast): return "vor mindestens"
         default: break
@@ -55,6 +57,7 @@ enum SmartField: String, Codable, CaseIterable, Identifiable {
     case rating
     case active
     case favorite
+    case variable
     case importedDaysAgo
     case inSet
 
@@ -72,6 +75,7 @@ enum SmartField: String, Codable, CaseIterable, Identifiable {
         case .rating: return "Bewertung"
         case .active: return "Status"
         case .favorite: return "Favorit"
+        case .variable: return "Variable Font"
         case .importedDaysAgo: return "Importiert"
         case .inSet: return "Set"
         }
@@ -91,7 +95,7 @@ enum SmartField: String, Codable, CaseIterable, Identifiable {
         case .name, .family, .style, .postScriptName, .foundry, .format, .tag: return .text
         case .rating, .importedDaysAgo: return .number
         case .inSet: return .set
-        case .active, .favorite: return .none
+        case .active, .favorite, .variable: return .none
         }
     }
 
@@ -187,7 +191,12 @@ extension SmartRule {
             let contained = setMembers[setID]?.contains(record.id) ?? false
             return op == .isTrue ? contained : !contained
         case .none:
-            let flag = field == .active ? record.activation.isActive : record.isFavorite
+            let flag: Bool
+            switch field {
+            case .active: flag = record.activation.isActive
+            case .variable: flag = record.isVariable
+            default: flag = record.isFavorite
+            }
             return op == .isTrue ? flag : !flag
         }
     }

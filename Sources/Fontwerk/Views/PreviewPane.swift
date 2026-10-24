@@ -16,10 +16,27 @@ struct PreviewPane: View {
     @AppStorage("previewText") private var sampleText = "Franz jagt im komplett verwahrlosten Taxi quer durch Bayern"
     @AppStorage("previewSize") private var size = 36.0
     @State private var mode: PreviewMode = .text
+    /// Chosen values for variable font axes, by axis tag.
+    @State private var axisValues: [String: Double] = [:]
 
     private var records: [FontRecord] {
-        store.records(withIDs: fontIDs)
-            .sorted { ($0.familyName, $0.styleName) < ($1.familyName, $1.styleName) }
+        store.records(withIDs: fontIDs).sorted { lhs, rhs in
+            if lhs.familyName != rhs.familyName {
+                return lhs.familyName.localizedStandardCompare(rhs.familyName) == .orderedAscending
+            }
+            return FaceOrder.areInOrder(lhs, rhs)
+        }
+    }
+
+    /// Axes of the selected variable fonts, merged by tag.
+    private var variationAxes: [VariationAxis] {
+        var result: [VariationAxis] = []
+        for record in records where record.isVariable {
+            for axis in record.axes ?? [] where !result.contains(where: { $0.tag == axis.tag }) {
+                result.append(axis)
+            }
+        }
+        return result
     }
 
     var body: some View {
@@ -63,8 +80,43 @@ struct PreviewPane: View {
                     Text("\(Int(size)) pt").monospacedDigit().frame(width: 50, alignment: .trailing)
                 }
             }
+            if mode != .info && !variationAxes.isEmpty {
+                axisControls
+            }
         }
         .padding(12)
+        .onChange(of: fontIDs) { _, _ in axisValues = [:] }
+    }
+
+    private var axisControls: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                VariableBadge()
+                Spacer()
+                Button("Zurücksetzen") { axisValues = [:] }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .disabled(axisValues.isEmpty)
+            }
+            ForEach(variationAxes) { axis in
+                HStack {
+                    Text(axis.displayName)
+                        .frame(width: 110, alignment: .leading)
+                        .help("Achse \(axis.tag)")
+                    Slider(
+                        value: Binding(
+                            get: { axisValues[axis.tag] ?? axis.defaultValue },
+                            set: { axisValues[axis.tag] = $0 }
+                        ),
+                        in: axis.minValue...axis.maxValue
+                    )
+                    Text(VariationAxis.format((axisValues[axis.tag] ?? axis.defaultValue).rounded()))
+                        .monospacedDigit()
+                        .frame(width: 44, alignment: .trailing)
+                }
+                .font(.caption)
+            }
+        }
     }
 
     @ViewBuilder
@@ -106,6 +158,10 @@ struct PreviewPane: View {
     }
 
     private func previewFont(_ record: FontRecord, size: Double) -> Font {
+        if record.isVariable && !axisValues.isEmpty,
+           let ctFont = FontFaceCache.shared.font(for: record, size: CGFloat(size), variation: axisValues) {
+            return Font(ctFont)
+        }
         if let ctFont = FontFaceCache.shared.font(for: record, size: CGFloat(size)) {
             return Font(ctFont)
         }
@@ -198,7 +254,10 @@ struct FontInfoView: View {
                 infoRow("PostScript-Name", record.postScriptName)
                 infoRow("Version", record.versionText)
                 infoRow("Hersteller", record.foundryText)
-                infoRow("Format", record.format)
+                infoRow("Format", record.isVariable ? "\(record.format) · Variable Font" : record.format)
+                ForEach(record.axes ?? []) { axis in
+                    infoRow("Achse \(axis.displayName)", "\(axis.rangeText) (\(axis.tag))")
+                }
                 infoRow("Glyphen", "\(record.glyphCount)")
                 infoRow("Status", record.isMissing ? "Datei fehlt" : record.activation.label)
                 infoRow("Dateigrösse", ByteCountFormatter.string(fromByteCount: record.fileSize, countStyle: .file))

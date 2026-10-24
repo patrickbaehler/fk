@@ -28,6 +28,12 @@ struct SidebarView: View {
                 Label("Konflikte", systemImage: "exclamationmark.2")
                     .badge(store.libraryDuplicateGroupCount)
                     .tag(SidebarItem.conflicts)
+                if !store.hiddenIDs.isEmpty {
+                    row("Ausgeblendet", icon: "eye.slash", item: .hidden)
+                        .contextMenu {
+                            Button("Alle wieder einblenden") { store.unhide(store.hiddenIDs) }
+                        }
+                }
             }
 
             Section("Sets") {
@@ -230,7 +236,7 @@ struct SetTreeRows: View {
 
     private func label(for set: FontSet) -> some View {
         Label(set.name, systemImage: icon(for: set))
-            .badge(store.fontIDs(inSet: set.id).count)
+            .badge(store.count(.set(set.id)))
             .help(set.applicationPath.map { "Wird beim Start von \(FileManager.default.displayName(atPath: $0)) aktiviert" } ?? "")
             .tag(SidebarItem.set(set.id))
             .contextMenu { menu(for: set) }

@@ -13,6 +13,11 @@ struct ScannedFace {
     var glyphCount: Int
     var faceIndex: Int
     var fileSize: Int64
+    var weight: Double
+    var width: Double
+    var slant: Double
+    var isItalic: Bool
+    var axes: [VariationAxis]
 
     var duplicateKey: String { "\(postScriptName)|\(version ?? "")" }
 }
@@ -56,6 +61,8 @@ enum FontScanner {
         return descriptors.enumerated().map { (index, descriptor) -> ScannedFace in
             let font = CTFontCreateWithFontDescriptor(descriptor, 12, nil)
             let formatNumber = (CTFontDescriptorCopyAttribute(descriptor, kCTFontFormatAttribute) as? NSNumber)?.uint32Value ?? 0
+            let traits = CTFontCopyTraits(font) as NSDictionary
+            let symbolic = (traits[kCTFontSymbolicTrait] as? NSNumber)?.uint32Value ?? 0
             return ScannedFace(
                 postScriptName: CTFontCopyPostScriptName(font) as String,
                 fullName: CTFontCopyFullName(font) as String,
@@ -66,7 +73,31 @@ enum FontScanner {
                 foundry: CTFontCopyName(font, kCTFontManufacturerNameKey) as String?,
                 glyphCount: CTFontGetGlyphCount(font),
                 faceIndex: index,
-                fileSize: size
+                fileSize: size,
+                weight: (traits[kCTFontWeightTrait] as? NSNumber)?.doubleValue ?? 0,
+                width: (traits[kCTFontWidthTrait] as? NSNumber)?.doubleValue ?? 0,
+                slant: (traits[kCTFontSlantTrait] as? NSNumber)?.doubleValue ?? 0,
+                isItalic: symbolic & CTFontSymbolicTraits.traitItalic.rawValue != 0,
+                axes: variationAxes(of: font)
+            )
+        }
+    }
+
+    static func variationAxes(of font: CTFont) -> [VariationAxis] {
+        guard let list = CTFontCopyVariationAxes(font) as? [[String: Any]] else { return [] }
+        return list.compactMap { axis in
+            guard let identifier = (axis[kCTFontVariationAxisIdentifierKey as String] as? NSNumber)?.uint32Value,
+                  let minValue = (axis[kCTFontVariationAxisMinimumValueKey as String] as? NSNumber)?.doubleValue,
+                  let maxValue = (axis[kCTFontVariationAxisMaximumValueKey as String] as? NSNumber)?.doubleValue,
+                  maxValue > minValue else { return nil }
+            let defaultValue = (axis[kCTFontVariationAxisDefaultValueKey as String] as? NSNumber)?.doubleValue ?? minValue
+            return VariationAxis(
+                identifier: identifier,
+                tag: VariationAxis.tagString(identifier),
+                name: axis[kCTFontVariationAxisNameKey as String] as? String ?? "",
+                minValue: minValue,
+                maxValue: maxValue,
+                defaultValue: defaultValue
             )
         }
     }
@@ -144,6 +175,18 @@ final class FontFaceCache {
 
     func font(for record: FontRecord, size: CGFloat) -> CTFont? {
         guard let descriptor = descriptor(for: record) else { return nil }
+        return CTFontCreateWithFontDescriptor(descriptor, size, nil)
+    }
+
+    /// A variable font with chosen axis values (keyed by axis tag).
+    func font(for record: FontRecord, size: CGFloat, variation: [String: Double]) -> CTFont? {
+        guard var descriptor = self.descriptor(for: record) else { return nil }
+        for axis in record.axes ?? [] {
+            guard let value = variation[axis.tag] else { continue }
+            let clamped = min(max(value, axis.minValue), axis.maxValue)
+            descriptor = CTFontDescriptorCreateCopyWithVariation(
+                descriptor, NSNumber(value: axis.identifier) as CFNumber, CGFloat(clamped))
+        }
         return CTFontCreateWithFontDescriptor(descriptor, size, nil)
     }
 

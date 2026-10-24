@@ -49,6 +49,36 @@ final class LibraryStore: ObservableObject {
         load()
         refreshActivationStates()
         startWatchingApplications()
+        updateMetadataIfNeeded()
+    }
+
+    /// Reads weight, width and variation axes for records imported by
+    /// older versions, once per file, in the background.
+    private func updateMetadataIfNeeded() {
+        let outdated = fonts.filter { ($0.metadataVersion ?? 0) < FontRecord.currentMetadataVersion && !$0.isMissing }
+        guard !outdated.isEmpty else { return }
+        let byFile = Dictionary(grouping: outdated, by: \.fileURL)
+        Task.detached(priority: .utility) { [weak self] in
+            var updates: [UUID: ScannedFace] = [:]
+            for (file, records) in byFile {
+                let faces = FontScanner.scan(file)
+                for record in records {
+                    let face = faces.first { $0.postScriptName == record.postScriptName && $0.faceIndex == record.faceIndex }
+                        ?? faces.first { $0.postScriptName == record.postScriptName }
+                    if let face { updates[record.id] = face }
+                }
+            }
+            let result = updates
+            await MainActor.run { self?.applyMetadataUpdates(result) }
+        }
+    }
+
+    private func applyMetadataUpdates(_ updates: [UUID: ScannedFace]) {
+        guard !updates.isEmpty else { return }
+        for index in fonts.indices {
+            if let face = updates[fonts[index].id] { fonts[index].applyMetadata(from: face) }
+        }
+        scheduleSave()
     }
 
     // MARK: - Persistence
@@ -88,26 +118,33 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Queries
 
+    /// Fonts that are not hidden.
+    var visibleFonts: [FontRecord] { fonts.filter { !$0.hidden } }
+
+    var hiddenIDs: Set<UUID> { Set(fonts.lazy.filter(\.hidden).map(\.id)) }
+
     func records(in source: SidebarItem, matching search: String) -> [FontRecord] {
         let base: [FontRecord]
+        let visible = source == .hidden ? [] : visibleFonts
         switch source {
-        case .all: base = fonts
-        case .active: base = fonts.filter { $0.activation.isActive }
-        case .inactive: base = fonts.filter { !$0.activation.isActive }
-        case .favorites: base = fonts.filter { $0.isFavorite }
-        case .missing: base = fonts.filter { $0.isMissing }
+        case .all: base = visible
+        case .active: base = visible.filter { $0.activation.isActive }
+        case .inactive: base = visible.filter { !$0.activation.isActive }
+        case .favorites: base = visible.filter { $0.isFavorite }
+        case .missing: base = visible.filter { $0.isMissing }
+        case .hidden: base = fonts.filter(\.hidden)
         case .recent:
             let cutoff = Date().addingTimeInterval(-14 * 24 * 3600)
-            base = fonts.filter { $0.importedAt >= cutoff }
+            base = visible.filter { $0.importedAt >= cutoff }
         case .set(let id):
             let ids = fontIDs(inSet: id)
-            base = fonts.filter { ids.contains($0.id) }
+            base = visible.filter { ids.contains($0.id) }
         case .smartSet(let id):
             base = smartSet(withID: id).map { matchingRecords(for: $0) } ?? []
         case .conflicts:
             let groups = conflictGroups(external: [:]).filter(\.hasLibraryDuplicates)
             let ids = Set(groups.flatMap { $0.records.map(\.id) })
-            base = fonts.filter { ids.contains($0.id) }
+            base = visible.filter { ids.contains($0.id) }
         }
         let query = search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return base }
@@ -149,6 +186,7 @@ final class LibraryStore: ObservableObject {
     @discardableResult
     func activate(_ ids: Set<UUID>, scope: ActivationState? = nil) -> (changed: Int, failures: [String]) {
         let target = (scope == .persistent || (scope == nil && defaultScope == .persistent)) ? ActivationState.persistent : .session
+        let ids = ids.subtracting(hiddenIDs)
         let states = stateByFile()
         var changes: [URL: ActivationState] = [:]
         var failures: [String] = []
@@ -730,7 +768,7 @@ final class LibraryStore: ObservableObject {
         var members: [UUID: Set<UUID>] = [:]
         for id in smartSet.referencedSetIDs { members[id] = fontIDs(inSet: id) }
         let now = Date()
-        return fonts.filter { smartSet.matches($0, now: now, setMembers: members) }
+        return visibleFonts.filter { smartSet.matches($0, now: now, setMembers: members) }
     }
 
     func saveSmartSet(_ smartSet: SmartSet) {
@@ -802,6 +840,80 @@ final class LibraryStore: ObservableObject {
             if !ids.isEmpty { activate(ids, scope: state) }
         }
         message = "\(removed.count) doppelte Schriften entfernt."
+    }
+
+    // MARK: - Hiding
+
+    /// Hides records without touching their files: they are deactivated
+    /// and no longer listed, but can be shown again at any time.
+    func hide(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        deactivate(ids, verify: false)
+        for index in fonts.indices where ids.contains(fonts[index].id) {
+            fonts[index].isHidden = true
+        }
+        scheduleSave()
+        message = "\(ids.count) Schriften ausgeblendet. Die Dateien bleiben unverändert."
+    }
+
+    func unhide(_ ids: Set<UUID>) {
+        for index in fonts.indices where ids.contains(fonts[index].id) {
+            fonts[index].isHidden = nil
+        }
+        scheduleSave()
+        message = "\(ids.count) Schriften wieder eingeblendet."
+    }
+
+    /// Like `resolveConflicts`, but hides the other versions instead of
+    /// removing them. Sets that contained a hidden version get the kept
+    /// one added; the hidden ones stay in the set for when they return.
+    func hideConflicts(_ decisions: [(keep: UUID, hide: Set<UUID>)]) {
+        let byID = Dictionary(fonts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var toHide = Set<UUID>()
+        var reactivate: [UUID: ActivationState] = [:]
+        var keepFor: [UUID: UUID] = [:]
+
+        for decision in decisions {
+            guard let keep = byID[decision.keep],
+                  let keepIndex = fonts.firstIndex(where: { $0.id == decision.keep }) else { continue }
+            var wanted = keep.activation
+            for id in decision.hide where id != keep.id {
+                guard let other = byID[id], other.fileURL != keep.fileURL else { continue }
+                toHide.insert(id)
+                keepFor[id] = keep.id
+                fonts[keepIndex].rating = max(fonts[keepIndex].rating, other.rating)
+                fonts[keepIndex].isFavorite = fonts[keepIndex].isFavorite || other.isFavorite
+                for tag in other.tags where !fonts[keepIndex].tags.contains(tag) {
+                    fonts[keepIndex].tags.append(tag)
+                }
+                if other.activation == .persistent {
+                    wanted = .persistent
+                } else if other.activation == .session && !wanted.isActive {
+                    wanted = .session
+                }
+            }
+            if wanted != keep.activation, wanted == .session || wanted == .persistent, keep.activation != .persistent {
+                reactivate[keep.id] = wanted
+            }
+        }
+        guard !toHide.isEmpty else { return }
+
+        for index in sets.indices where !sets[index].isFolder {
+            var members = Set(sets[index].fontIDs)
+            for id in sets[index].fontIDs {
+                if let keep = keepFor[id], !members.contains(keep) {
+                    sets[index].fontIDs.append(keep)
+                    members.insert(keep)
+                }
+            }
+        }
+
+        hide(toHide)
+        for state in [ActivationState.session, .persistent] {
+            let ids = Set(reactivate.filter { $0.value == state }.map(\.key))
+            if !ids.isEmpty { activate(ids, scope: state) }
+        }
+        message = "\(toHide.count) Fassungen ausgeblendet, die Dateien bleiben auf dem Computer."
     }
 
     // MARK: - Program sets

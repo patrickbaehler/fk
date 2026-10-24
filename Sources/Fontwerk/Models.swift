@@ -44,6 +44,19 @@ struct FontRecord: Identifiable, Codable, Hashable {
     var isFavorite: Bool
     var tags: [String]
     var isMissing: Bool
+    // Added in version 0.5; optional so older libraries still load.
+    /// CoreText weight, width and slant traits (-1 … 1).
+    var weight: Double?
+    var widthTrait: Double?
+    var slant: Double?
+    var isItalic: Bool?
+    /// Variation axes; empty for static fonts, nil if not read yet.
+    var axes: [VariationAxis]?
+    /// Hidden records stay on disk and in the library but are not listed.
+    var isHidden: Bool?
+    var metadataVersion: Int?
+
+    static let currentMetadataVersion = 2
 
     init(scanned face: ScannedFace, fileURL: URL) {
         id = UUID()
@@ -64,11 +77,102 @@ struct FontRecord: Identifiable, Codable, Hashable {
         isFavorite = false
         tags = []
         isMissing = false
+        applyMetadata(from: face)
+    }
+
+    mutating func applyMetadata(from face: ScannedFace) {
+        weight = face.weight
+        widthTrait = face.width
+        slant = face.slant
+        isItalic = face.isItalic
+        axes = face.axes
+        metadataVersion = Self.currentMetadataVersion
     }
 
     var duplicateKey: String { "\(postScriptName)|\(version ?? "")" }
     var versionText: String { version ?? "" }
     var foundryText: String { foundry ?? "" }
+    var isVariable: Bool { !(axes ?? []).isEmpty }
+    var hidden: Bool { isHidden ?? false }
+
+    /// Name shown for a face listed under its family.
+    var styleDisplayName: String { styleName.isEmpty ? fullName : styleName }
+}
+
+/// One axis of a variable font, e.g. weight from 100 to 900.
+struct VariationAxis: Codable, Hashable, Identifiable {
+    var identifier: UInt32
+    var tag: String
+    var name: String
+    var minValue: Double
+    var maxValue: Double
+    var defaultValue: Double
+
+    var id: String { tag }
+
+    var displayName: String {
+        switch tag {
+        case "wght": return "Gewicht"
+        case "wdth": return "Breite"
+        case "slnt": return "Neigung"
+        case "ital": return "Kursiv"
+        case "opsz": return "Optische Grösse"
+        case "GRAD": return "Grad"
+        default: return name.isEmpty ? tag : name
+        }
+    }
+
+    var rangeText: String {
+        "\(Self.format(minValue)) – \(Self.format(maxValue)), Standard \(Self.format(defaultValue))"
+    }
+
+    static func format(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(format: "%.1f", value)
+    }
+
+    static func tagString(_ identifier: UInt32) -> String {
+        let bytes = [24, 16, 8, 0].map { UInt8((identifier >> UInt32($0)) & 0xFF) }
+        if bytes.allSatisfy({ $0 >= 32 && $0 < 127 }), let text = String(bytes: bytes, encoding: .ascii) {
+            return text
+        }
+        return String(identifier)
+    }
+}
+
+/// Orders faces within a family: by width, weight, then upright before italic.
+enum FaceOrder {
+    static let styleWords: [(String, Double)] = [
+        ("hairline", -0.9), ("thin", -0.8), ("extralight", -0.6), ("ultralight", -0.6),
+        ("light", -0.4), ("book", -0.1), ("regular", 0), ("roman", 0), ("normal", 0),
+        ("medium", 0.23), ("semibold", 0.3), ("demibold", 0.3), ("demi", 0.3),
+        ("bold", 0.4), ("extrabold", 0.56), ("ultrabold", 0.56), ("heavy", 0.62),
+        ("black", 0.62), ("ultra", 0.7),
+    ]
+
+    /// Weight from the stored trait, or guessed from the style name.
+    static func weight(of record: FontRecord) -> Double {
+        if let weight = record.weight { return weight }
+        let style = record.styleName.lowercased().replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "-", with: "")
+        // Longest matching word wins ("extrabold" before "bold").
+        let match = styleWords.filter { style.contains($0.0) }.max { $0.0.count < $1.0.count }
+        return match?.1 ?? 0
+    }
+
+    static func italic(_ record: FontRecord) -> Bool {
+        if let italic = record.isItalic { return italic }
+        let style = record.styleName.lowercased()
+        return style.contains("italic") || style.contains("oblique") || style.contains("kursiv")
+    }
+
+    static func areInOrder(_ lhs: FontRecord, _ rhs: FontRecord) -> Bool {
+        let lw = lhs.widthTrait ?? 0, rw = rhs.widthTrait ?? 0
+        if abs(lw - rw) > 0.01 { return lw < rw }
+        let lweight = weight(of: lhs), rweight = weight(of: rhs)
+        if abs(lweight - rweight) > 0.01 { return lweight < rweight }
+        let li = italic(lhs), ri = italic(rhs)
+        if li != ri { return !li }
+        return lhs.styleDisplayName.localizedStandardCompare(rhs.styleDisplayName) == .orderedAscending
+    }
 }
 
 /// A user-defined collection of fonts, or a folder that groups sets.
@@ -185,6 +289,7 @@ enum SidebarItem: Hashable {
     case favorites
     case recent
     case missing
+    case hidden
     case conflicts
     case set(UUID)
     case smartSet(UUID)

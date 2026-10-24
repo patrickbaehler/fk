@@ -72,10 +72,46 @@ enum ExternalFonts {
     }
 }
 
+/// Which file format to prefer when the same font exists several times:
+/// OpenType (.otf) first, then TrueType; PostScript Type 1 and old Mac
+/// suitcases last.
+enum FormatPreference {
+    static func rank(_ record: FontRecord) -> Int {
+        let ext = record.fileURL.pathExtension.lowercased()
+        if ["", "suit", "dfont", "bmap"].contains(ext) { return 5 }
+        switch record.format {
+        case "OpenType PS": return 0
+        case "OpenType TT": return 1
+        case "TrueType": return 2
+        case "WOFF", "WOFF2": return 3
+        case "PostScript": return 6
+        case "Bitmap": return 7
+        default:
+            switch ext {
+            case "otf": return 0
+            case "ttf", "ttc": return 2
+            case "pfb", "pfa": return 6
+            default: return 4
+            }
+        }
+    }
+
+    static func label(_ record: FontRecord) -> String {
+        switch rank(record) {
+        case 0: return "OpenType"
+        case 1, 2: return "TrueType"
+        case 3: return "Webfont"
+        case 5: return "Koffer"
+        case 6: return "PostScript Type 1"
+        default: return record.format
+        }
+    }
+}
+
 extension LibraryStore {
     private func recordsByPostScriptName() -> [String: [FontRecord]] {
         var result: [String: [FontRecord]] = [:]
-        for record in fonts where !record.postScriptName.isEmpty {
+        for record in fonts where !record.postScriptName.isEmpty && !record.hidden {
             result[record.postScriptName, default: []].append(record)
         }
         return result
@@ -93,7 +129,11 @@ extension LibraryStore {
             guard distinctFiles > 1 || !outside.isEmpty else { continue }
             groups.append(ConflictGroup(
                 postScriptName: name,
-                records: records.sorted { VersionComparison.isNewer($0.versionText, than: $1.versionText) },
+                records: records.sorted { lhs, rhs in
+                    let lr = FormatPreference.rank(lhs), rr = FormatPreference.rank(rhs)
+                    if lr != rr { return lr < rr }
+                    return VersionComparison.isNewer(lhs.versionText, than: rhs.versionText)
+                },
                 externalLocations: outside,
                 suggestedKeepID: distinctFiles > 1 ? Self.suggestedKeep(among: records)?.id : nil
             ))
@@ -101,10 +141,12 @@ extension LibraryStore {
         return groups.sorted { $0.postScriptName.localizedStandardCompare($1.postScriptName) == .orderedAscending }
     }
 
-    /// Newest version first, then more glyphs, then the one already
-    /// active, then the earliest import.
+    /// Preferred format first (.otf, then TrueType), then the newest
+    /// version, more glyphs, the one already active, the earliest import.
     static func suggestedKeep(among records: [FontRecord]) -> FontRecord? {
         records.max { lhs, rhs in
+            let lr = FormatPreference.rank(lhs), rr = FormatPreference.rank(rhs)
+            if lr != rr { return lr > rr }
             if VersionComparison.isNewer(rhs.versionText, than: lhs.versionText) { return true }
             if VersionComparison.isNewer(lhs.versionText, than: rhs.versionText) { return false }
             if lhs.glyphCount != rhs.glyphCount { return lhs.glyphCount < rhs.glyphCount }
@@ -113,8 +155,13 @@ extension LibraryStore {
         }
     }
 
+    /// Number of files the automatic decisions would affect.
+    func affectedCount(_ decisions: [(keep: UUID, remove: Set<UUID>)]) -> Int {
+        decisions.reduce(0) { $0 + $1.remove.count }
+    }
+
     /// For every group with library duplicates: keep the suggested
-    /// record, remove the others.
+    /// record, remove (or hide) the others.
     func automaticConflictDecisions() -> [(keep: UUID, remove: Set<UUID>)] {
         conflictGroups(external: [:]).compactMap { group -> (keep: UUID, remove: Set<UUID>)? in
             guard group.hasLibraryDuplicates, let keep = group.suggestedKeepID else { return nil }
